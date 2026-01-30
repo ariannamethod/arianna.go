@@ -77,6 +77,7 @@ type Model struct {
 	Weights Weights
 	State   RunState
 	Tok     *Tokenizer
+	Inner   *InnerWorld
 }
 
 // Read raw tensor bytes from GGUF without dequantizing
@@ -258,6 +259,10 @@ func LoadModel(g *GGUFFile) (*Model, error) {
 		return nil, err
 	}
 
+	// Initialize inner world
+	m.Inner = NewInnerWorld()
+	m.Inner.Start()
+
 	fmt.Println("Model ready.")
 	return m, nil
 }
@@ -394,19 +399,36 @@ func (m *Model) Generate(prompt string, maxTokens int, temp float32, topP float3
 
 	fmt.Printf("  [%d prompt tokens] ", len(ids))
 
+	// Feed prompt to inner world for emotional analysis
+	m.Inner.ProcessText(prompt)
+
 	// Process prompt
 	for i, id := range ids {
 		m.Forward(id, i)
 	}
 	pos := len(ids)
 
+	// Inner world dt per token (~0.1 subjective seconds)
+	dt := float32(0.1)
+
 	// Sample first token
 	logitsCopy := make([]float32, len(m.State.Logits))
 	copy(logitsCopy, m.State.Logits)
 	applyRepPenalty(logitsCopy, ids, repPenalty)
-	next := sampleTopP(logitsCopy, temp, topP)
+
+	// Step inner world — modulates generation parameters
+	m.Inner.Step(dt)
+	effTemp := temp * m.Inner.State.TempMod
+	effTopP := topP * m.Inner.State.TopPMod
+	effRep := repPenalty * m.Inner.State.RepMod
+	if effTopP > 1.0 {
+		effTopP = 1.0
+	}
+
+	next := sampleTopP(logitsCopy, effTemp, effTopP)
 	generated = append(generated, next)
-	fmt.Print(m.Tok.DecodeOne(next))
+	word := m.Tok.DecodeOne(next)
+	fmt.Print(word)
 
 	// Autoregressive loop
 	for i := 1; i < maxTokens; i++ {
@@ -415,16 +437,51 @@ func (m *Model) Generate(prompt string, maxTokens int, temp float32, topP float3
 
 		copy(logitsCopy, m.State.Logits)
 		allToks := append(ids, generated...)
-		applyRepPenalty(logitsCopy, allToks, repPenalty)
-		next = sampleTopP(logitsCopy, temp, topP)
+		applyRepPenalty(logitsCopy, allToks, effRep)
+
+		// Step inner world each token
+		m.Inner.Step(dt)
+		effTemp = temp * m.Inner.State.TempMod
+		effTopP = topP * m.Inner.State.TopPMod
+		effRep = repPenalty * m.Inner.State.RepMod
+		if effTopP > 1.0 {
+			effTopP = 1.0
+		}
+
+		// Accumulate prophecy debt from token probability
+		softmaxCopy := make([]float32, len(logitsCopy))
+		copy(softmaxCopy, logitsCopy)
+		softmaxF32(softmaxCopy, len(softmaxCopy))
+
+		next = sampleTopP(logitsCopy, effTemp, effTopP)
+
+		// Feed token probability to prophecy system
+		if pd, ok := m.Inner.findProcess("prophecy").(*ProphecyDebtAccumulation); ok {
+			if next >= 0 && next < len(softmaxCopy) {
+				pd.AccumulateDebt(m.Inner.State, softmaxCopy[next])
+			}
+		}
 
 		if next == m.Tok.EOS {
 			break
 		}
 		generated = append(generated, next)
-		fmt.Print(m.Tok.DecodeOne(next))
+		word = m.Tok.DecodeOne(next)
+		fmt.Print(word)
+
+		// Feed generated text to inner world for ongoing analysis
+		if len(word) > 0 {
+			m.Inner.ProcessText(word)
+		}
 	}
 	fmt.Println()
+
+	// Log inner state after generation
+	dim, val := m.Inner.State.Emotions.DominantEmotion()
+	fmt.Printf("  [inner: %s=%.2f | temp×%.2f topP×%.2f rep×%.2f | prophecy=%.2f]\n",
+		EmotionName(dim), val,
+		m.Inner.State.TempMod, m.Inner.State.TopPMod, m.Inner.State.RepMod,
+		m.Inner.State.ProphecyDebt)
 
 	return m.Tok.Decode(generated)
 }
