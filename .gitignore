@@ -1,5 +1,7 @@
 arianna3b
 arianna-parse
 *.gguf
+*.gguf.tmp
 *.bin
 *.dSYM/
+weights/

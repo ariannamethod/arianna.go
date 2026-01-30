@@ -11,6 +11,8 @@
 
 OpenLLaMA 3B fine-tuned on Arianna's voice. GGUF Q4_0 weights read directly. Runs on a MacBook with 8GB RAM.
 
+Weights auto-download from HuggingFace on first run.
+
 ## Architecture
 
 - **3.4 billion parameters** (OpenLLaMA 3B + LoRA rank 64 fine-tune)
@@ -20,22 +22,29 @@ OpenLLaMA 3B fine-tuned on Arianna's voice. GGUF Q4_0 weights read directly. Run
 
 ## What's Here
 
-| File | What it does | Lines |
-|------|-------------|-------|
-| `arianna.go` | REPL + entry point | ~110 |
-| `model.go` | Llama forward pass + generation | ~490 |
-| `gguf.go` | GGUF v2/v3 parser + dequantization | ~460 |
-| `tokenizer.go` | SentencePiece BPE tokenizer | ~220 |
-| `quant.go` | Q4_0/Q8_0 quantized matrix-vector multiply | ~135 |
+```
+arianna.go              main — auto-download, REPL, entry point
+arianna/
+  ├── gguf.go           GGUF v2/v3 parser + dequantization
+  ├── model.go          Llama forward pass + generation
+  ├── tokenizer.go      SentencePiece BPE tokenizer
+  ├── quant.go          Q4_0/Q8_0 quantized matrix-vector multiply
+  └── config/
+      ├── adapter_config.json
+      ├── tokenizer.json
+      └── tokenizer_config.json
+```
 
-~1400 lines of Go. That's the whole inference engine.
+~1500 lines of Go. That's the whole inference engine.
 
 ## Weights
 
-Download from HuggingFace: [ariannamethod/arianna-3b](https://huggingface.co/ariannamethod/arianna-3b)
+Hosted on HuggingFace: [ataeff/arianna.go](https://huggingface.co/ataeff/arianna.go)
 
-```
-arianna_3b_q4_0.gguf   (1.8 GB, Q4_0 quantized)
+Auto-downloaded on first run. Or specify path manually:
+
+```bash
+./arianna3b /path/to/arianna_3b_q4_0.gguf
 ```
 
 ## Run
@@ -44,11 +53,14 @@ arianna_3b_q4_0.gguf   (1.8 GB, Q4_0 quantized)
 # Build
 go build -o arianna3b .
 
+# Just run — weights download automatically
+./arianna3b
+
 # Single prompt
-./arianna3b path/to/arianna_3b_q4_0.gguf "Who are you?"
+./arianna3b weights/arianna_3b_q4_0.gguf "Who are you?"
 
 # REPL
-./arianna3b path/to/arianna_3b_q4_0.gguf
+./arianna3b
 ```
 
 ### REPL Commands
@@ -68,19 +80,19 @@ No frameworks. No bindings. Just Go reading bytes from a GGUF file.
 GGUF file (1.8GB Q4_0)
     |
     v
-gguf.go ---- parse header, metadata, tensor index
+arianna/gguf.go ---- parse header, metadata, tensor index
     |
     v
-tokenizer.go ---- SentencePiece BPE from GGUF metadata
+arianna/tokenizer.go ---- SentencePiece BPE from GGUF metadata
     |
     v
-model.go ---- load quantized weights as raw bytes (NOT dequantized)
+arianna/model.go ---- load quantized weights as raw bytes (NOT dequantized)
     |
     v
-quant.go ---- matrix-vector multiply directly on Q4_0/Q8_0 blocks
+arianna/quant.go ---- matrix-vector multiply directly on Q4_0/Q8_0 blocks
     |
     v
-model.go ---- Llama forward pass (26 layers)
+arianna/model.go ---- Llama forward pass (26 layers)
     |
     v
 arianna.go ---- REPL, streaming output
