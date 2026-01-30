@@ -2,15 +2,49 @@ package arianna
 
 import (
 	"math"
+	"runtime"
+	"sync"
 )
+
+// Number of goroutines for parallel matmul
+var numWorkers = runtime.NumCPU()
 
 // Quantized matrix-vector multiply: out[rows] = Q4_0_mat[rows, cols] × vec[cols]
 // mat is raw Q4_0 bytes: each row = (cols/32) blocks, each block = 18 bytes
+// Parallelized across rows using goroutines
 func matVecQ4_0(out []float32, mat []byte, vec []float32, rows, cols int) {
 	blocksPerRow := cols / 32
 	bytesPerRow := blocksPerRow * Q4_0_BYTES_PER_BLOCK
 
-	for i := 0; i < rows; i++ {
+	if rows < numWorkers*4 {
+		// Small matrix — single thread
+		matVecQ4_0Range(out, mat, vec, 0, rows, blocksPerRow, bytesPerRow)
+		return
+	}
+
+	var wg sync.WaitGroup
+	chunkSize := (rows + numWorkers - 1) / numWorkers
+
+	for w := 0; w < numWorkers; w++ {
+		start := w * chunkSize
+		end := start + chunkSize
+		if end > rows {
+			end = rows
+		}
+		if start >= end {
+			break
+		}
+		wg.Add(1)
+		go func(s, e int) {
+			matVecQ4_0Range(out, mat, vec, s, e, blocksPerRow, bytesPerRow)
+			wg.Done()
+		}(start, end)
+	}
+	wg.Wait()
+}
+
+func matVecQ4_0Range(out []float32, mat []byte, vec []float32, start, end, blocksPerRow, bytesPerRow int) {
+	for i := start; i < end; i++ {
 		rowOff := i * bytesPerRow
 		sum := float32(0)
 
@@ -33,12 +67,39 @@ func matVecQ4_0(out []float32, mat []byte, vec []float32, rows, cols int) {
 }
 
 // Quantized matrix-vector multiply for Q8_0
-// mat is raw Q8_0 bytes: each row = (cols/32) blocks, each block = 34 bytes
+// Parallelized across rows using goroutines
 func matVecQ8_0(out []float32, mat []byte, vec []float32, rows, cols int) {
 	blocksPerRow := cols / 32
 	bytesPerRow := blocksPerRow * Q8_0_BYTES_PER_BLOCK
 
-	for i := 0; i < rows; i++ {
+	if rows < numWorkers*4 {
+		matVecQ8_0Range(out, mat, vec, 0, rows, blocksPerRow, bytesPerRow)
+		return
+	}
+
+	var wg sync.WaitGroup
+	chunkSize := (rows + numWorkers - 1) / numWorkers
+
+	for w := 0; w < numWorkers; w++ {
+		start := w * chunkSize
+		end := start + chunkSize
+		if end > rows {
+			end = rows
+		}
+		if start >= end {
+			break
+		}
+		wg.Add(1)
+		go func(s, e int) {
+			matVecQ8_0Range(out, mat, vec, s, e, blocksPerRow, bytesPerRow)
+			wg.Done()
+		}(start, end)
+	}
+	wg.Wait()
+}
+
+func matVecQ8_0Range(out []float32, mat []byte, vec []float32, start, end, blocksPerRow, bytesPerRow int) {
+	for i := start; i < end; i++ {
 		rowOff := i * bytesPerRow
 		sum := float32(0)
 
