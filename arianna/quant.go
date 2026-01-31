@@ -138,6 +138,20 @@ func dotF32(a, b []float32) float32 {
 	return sum
 }
 
+// Fast exp approximation (Schraudolph's method, ~1.5% max error)
+// Avoids float64 round-trip through math.Exp
+func fastExp(x float32) float32 {
+	if x < -88 {
+		return 0
+	}
+	if x > 88 {
+		return math.MaxFloat32
+	}
+	// 2^23 / ln(2) ≈ 12102203.16, bias = 127 * 2^23 = 1065353216
+	i := int32(x*12102203.0) + 1065353216
+	return math.Float32frombits(uint32(i))
+}
+
 // RMSNorm: out = (x / rms(x)) * weight
 func rmsNormF32(out, x, weight []float32, eps float32) {
 	n := len(x)
@@ -151,26 +165,50 @@ func rmsNormF32(out, x, weight []float32, eps float32) {
 	}
 }
 
-// Apply RoPE to Q and K vectors in-place
-func ropeF32(q, k []float32, pos, headDim, nHeads, nKVHeads int, theta float32) {
-	for i := 0; i < headDim/2; i++ {
-		freq := 1.0 / float32(math.Pow(float64(theta), float64(2*i)/float64(headDim)))
-		angle := float32(pos) * freq
-		cos := float32(math.Cos(float64(angle)))
-		sin := float32(math.Sin(float64(angle)))
+// RoPE precomputed cos/sin table
+type RoPETable struct {
+	Cos []float32 // [contextLen * headDim/2]
+	Sin []float32 // [contextLen * headDim/2]
+	HalfDim int
+}
+
+func NewRoPETable(contextLen, headDim int, theta float32) *RoPETable {
+	halfDim := headDim / 2
+	cos := make([]float32, contextLen*halfDim)
+	sin := make([]float32, contextLen*halfDim)
+
+	for pos := 0; pos < contextLen; pos++ {
+		for i := 0; i < halfDim; i++ {
+			freq := 1.0 / float32(math.Pow(float64(theta), float64(2*i)/float64(headDim)))
+			angle := float64(float32(pos) * freq)
+			cos[pos*halfDim+i] = float32(math.Cos(angle))
+			sin[pos*halfDim+i] = float32(math.Sin(angle))
+		}
+	}
+	return &RoPETable{Cos: cos, Sin: sin, HalfDim: halfDim}
+}
+
+// Apply RoPE using precomputed table
+func ropeF32(q, k []float32, pos int, rope *RoPETable, nHeads, nKVHeads, headDim int) {
+	halfDim := rope.HalfDim
+	off := pos * halfDim
+
+	for i := 0; i < halfDim; i++ {
+		cos := rope.Cos[off+i]
+		sin := rope.Sin[off+i]
 
 		for h := 0; h < nHeads; h++ {
-			off := h*headDim + i*2
-			q0, q1 := q[off], q[off+1]
-			q[off] = q0*cos - q1*sin
-			q[off+1] = q0*sin + q1*cos
+			hoff := h*headDim + i*2
+			q0, q1 := q[hoff], q[hoff+1]
+			q[hoff] = q0*cos - q1*sin
+			q[hoff+1] = q0*sin + q1*cos
 		}
 
 		for h := 0; h < nKVHeads; h++ {
-			off := h*headDim + i*2
-			k0, k1 := k[off], k[off+1]
-			k[off] = k0*cos - k1*sin
-			k[off+1] = k0*sin + k1*cos
+			hoff := h*headDim + i*2
+			k0, k1 := k[hoff], k[hoff+1]
+			k[hoff] = k0*cos - k1*sin
+			k[hoff+1] = k0*sin + k1*cos
 		}
 	}
 }
@@ -185,10 +223,11 @@ func softmaxF32(x []float32, n int) {
 	}
 	sum := float32(0)
 	for i := 0; i < n; i++ {
-		x[i] = float32(math.Exp(float64(x[i] - maxVal)))
+		x[i] = fastExp(x[i] - maxVal)
 		sum += x[i]
 	}
+	inv := float32(1.0) / sum
 	for i := 0; i < n; i++ {
-		x[i] /= sum
+		x[i] *= inv
 	}
 }

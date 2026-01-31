@@ -16,8 +16,8 @@ import (
 
 const (
 	defaultWeightsDir  = "weights"
-	defaultWeightsFile = "arianna_3b_q4_0.gguf"
-	weightsURL         = "https://huggingface.co/ataeff/arianna.go/resolve/main/ariannaweights/arianna_3b_q4_0.gguf"
+	defaultWeightsFile = "arianna_3b_step2250_q4_0.gguf"
+	weightsURL         = "https://huggingface.co/ataeff/arianna.go/resolve/main/ariannaweights/3b-2250/arianna_3b_step2250_q4_0.gguf"
 )
 
 func downloadWeights(dest string) error {

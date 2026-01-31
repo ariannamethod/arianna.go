@@ -428,29 +428,38 @@ func dequantQ8_0(buf []byte, out []float32, nblocks int) {
 	}
 }
 
-func float16to32(h uint16) float32 {
-	sign := uint32(h>>15) & 1
-	exp := uint32(h>>10) & 0x1F
-	mant := uint32(h) & 0x3FF
+// float16 → float32 lookup table (65536 entries × 4 bytes = 256KB, fits in L2)
+var fp16LUT [65536]float32
 
-	if exp == 0 {
-		if mant == 0 {
-			return math.Float32frombits(sign << 31)
+func init() {
+	for h := 0; h < 65536; h++ {
+		sign := uint32(h>>15) & 1
+		exp := uint32(h>>10) & 0x1F
+		mant := uint32(h) & 0x3FF
+
+		if exp == 0 {
+			if mant == 0 {
+				fp16LUT[h] = math.Float32frombits(sign << 31)
+				continue
+			}
+			for mant&0x400 == 0 {
+				mant <<= 1
+				exp--
+			}
+			exp++
+			mant &= 0x3FF
+		} else if exp == 31 {
+			fp16LUT[h] = math.Float32frombits((sign << 31) | 0x7F800000 | (mant << 13))
+			continue
 		}
-		// Subnormal
-		for mant&0x400 == 0 {
-			mant <<= 1
-			exp--
-		}
-		exp++
-		mant &= 0x3FF
-	} else if exp == 31 {
-		// Inf/NaN
-		return math.Float32frombits((sign << 31) | 0x7F800000 | (mant << 13))
+
+		exp = exp + 127 - 15
+		fp16LUT[h] = math.Float32frombits((sign << 31) | (exp << 23) | (mant << 13))
 	}
+}
 
-	exp = exp + 127 - 15
-	return math.Float32frombits((sign << 31) | (exp << 23) | (mant << 13))
+func float16to32(h uint16) float32 {
+	return fp16LUT[h]
 }
 
 func align(offset int64, alignment int64) int64 {

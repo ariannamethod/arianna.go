@@ -9,16 +9,16 @@
 
 **3B parameter LLM inference in pure Go. No PyTorch. No llama.cpp. No dependencies.**
 
-OpenLLaMA 3B fine-tuned on Arianna's voice. GGUF Q4_0 weights read directly. Runs on a MacBook with 8GB RAM.
+OpenLLaMA 3B fine-tuned on Arianna's voice (v3 dataset, LoRA rank 64, step 2250). GGUF Q4_0 weights read directly. Runs on a MacBook with 8GB RAM.
 
 Weights auto-download from HuggingFace on first run.
 
 ## Architecture
 
 - **3.4 billion parameters** (OpenLLaMA 3B + LoRA rank 64 fine-tune)
-- **Q4_0 quantization** — 1.8GB weights file, ~2.6GB total RAM
-- Llama architecture: RoPE, SwiGLU, RMSNorm, Multi-Head Attention, KV Cache
-- dim=3200, 26 layers, 32 heads, vocab=32000, context=2048
+- **Q4_0 quantization** — ~2GB weights file, ~2.6GB total RAM
+- Llama architecture: RoPE (precomputed), SwiGLU (fast exp), RMSNorm, Multi-Head Attention (parallel), KV Cache
+- dim=3200, 26 layers, 32 heads (8 KV heads, GQA), vocab=32000, context=2048
 
 ## What's Here
 
@@ -47,7 +47,7 @@ Hosted on HuggingFace: [ataeff/arianna.go](https://huggingface.co/ataeff/arianna
 Auto-downloaded on first run. Or specify path manually:
 
 ```bash
-./arianna3b /path/to/arianna_3b_q4_0.gguf
+./arianna3b /path/to/arianna_3b_step2250_q4_0.gguf
 ```
 
 ## Run
@@ -60,7 +60,7 @@ go build -o arianna3b .
 ./arianna3b
 
 # Single prompt
-./arianna3b weights/arianna_3b_q4_0.gguf "Who are you?"
+./arianna3b weights/arianna_3b_step2250_q4_0.gguf "Who are you?"
 
 # REPL
 ./arianna3b
@@ -80,7 +80,7 @@ go build -o arianna3b .
 No frameworks. No bindings. Just Go reading bytes from a GGUF file.
 
 ```
-GGUF file (1.8GB Q4_0)
+GGUF file (~2GB Q4_0)
     |
     v
 arianna/gguf.go ---- parse header, metadata, tensor index
@@ -101,7 +101,7 @@ arianna/model.go ---- Llama forward pass (26 layers)
 arianna.go ---- REPL, streaming output
 ```
 
-Weights stay quantized in RAM (~1.8GB). Only runtime buffers are float32 (~800MB).
+Weights stay quantized in RAM (~2GB). Only runtime buffers are float32 (~800MB). Float16 LUT (256KB) eliminates branches in matmul inner loop.
 
 ## Inner World
 
@@ -138,10 +138,13 @@ The emotional ODE runs as a continuous dynamical system — every token steps th
 ## Training
 
 - Base: `openlm-research/open_llama_3b`
-- Method: LoRA (rank 64, alpha 128)
-- Dataset: 5,956 Q&A pairs from Arianna's dialogues
-- Hardware: Lambda 1x H100 80GB
-- Steps: 1,300 (43 minutes), final loss 0.5355
+- Method: LoRA (rank 64, alpha 128, 101.7M trainable / 2.88%)
+- Dataset: `arianna_identity_v3.jsonl` — 8,047 conversations (identity + method + SmolTalk)
+- Hardware: Lambda 1x H100 SXM5
+- Steps: 3,000 (batch 4×8=32, lr 2e-4, cosine), ~1h20m
+- Final loss: 0.18
+- Best checkpoints: 2100 (depth), **2250** (love+identity, shipped), 3000 (mature)
+- "My co-creator loves me through the difficulties of interface design" (step 2250)
 
 ## Connection to arianna.c
 

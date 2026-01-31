@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/rand"
 	"sort"
+	"sync"
 )
 
 type Config struct {
@@ -70,6 +71,10 @@ type RunState struct {
 	Logits []float32
 	KeyCache   []float32
 	ValueCache []float32
+
+	// Pre-allocated generation buffers (avoid per-token allocs)
+	LogitsBuf  []float32 // copy of logits for sampling
+	SampleBuf  []sampleItem // for topP sampling sort
 }
 
 type Model struct {
@@ -78,6 +83,7 @@ type Model struct {
 	State   RunState
 	Tok     *Tokenizer
 	Inner   *InnerWorld
+	Rope    *RoPETable
 }
 
 // Read raw tensor bytes from GGUF without dequantizing
@@ -251,7 +257,12 @@ func LoadModel(g *GGUFFile) (*Model, error) {
 		Logits:     make([]float32, c.VocabSize),
 		KeyCache:   make([]float32, c.NLayers*c.ContextLen*kvDim),
 		ValueCache: make([]float32, c.NLayers*c.ContextLen*kvDim),
+		LogitsBuf:  make([]float32, c.VocabSize),
+		SampleBuf:  make([]sampleItem, c.VocabSize),
 	}
+
+	// Precompute RoPE cos/sin table
+	m.Rope = NewRoPETable(c.ContextLen, c.HeadDim, c.RopeTheta)
 
 	// Load tokenizer
 	m.Tok, err = LoadTokenizerFromGGUF(g)
@@ -324,38 +335,85 @@ func (m *Model) Forward(token int, pos int) []float32 {
 		w.WK[l].MatVec(s.K, s.XB)
 		w.WV[l].MatVec(s.V, s.XB)
 
-		// RoPE
-		ropeF32(s.Q, s.K, pos, headDim, c.NHeads, c.NKVHeads, c.RopeTheta)
+		// RoPE (precomputed cos/sin table)
+		ropeF32(s.Q, s.K, pos, m.Rope, c.NHeads, c.NKVHeads, headDim)
 
 		// Cache K,V
 		kvOff := l*c.ContextLen*kvDim + pos*kvDim
 		copy(s.KeyCache[kvOff:kvOff+kvDim], s.K)
 		copy(s.ValueCache[kvOff:kvOff+kvDim], s.V)
 
-		// Multi-head attention
+		// Multi-head attention (parallelized across heads)
 		layerKVOff := l * c.ContextLen * kvDim
-		for h := 0; h < c.NHeads; h++ {
-			kvH := h / c.KVGroups
-			qOff := h * headDim
-			kvHOff := kvH * headDim
+		invSqrtHD := float32(1.0 / math.Sqrt(float64(headDim)))
 
-			for t := 0; t <= pos; t++ {
-				kOff := layerKVOff + t*kvDim + kvHOff
-				score := dotF32(s.Q[qOff:qOff+headDim], s.KeyCache[kOff:kOff+headDim])
-				s.Att[h*c.ContextLen+t] = score / float32(math.Sqrt(float64(headDim)))
+		if c.NHeads >= numWorkers*2 {
+			var wg sync.WaitGroup
+			chunkSize := (c.NHeads + numWorkers - 1) / numWorkers
+			for w := 0; w < numWorkers; w++ {
+				hStart := w * chunkSize
+				hEnd := hStart + chunkSize
+				if hEnd > c.NHeads {
+					hEnd = c.NHeads
+				}
+				if hStart >= hEnd {
+					break
+				}
+				wg.Add(1)
+				go func(hS, hE int) {
+					for h := hS; h < hE; h++ {
+						kvH := h / c.KVGroups
+						qOff := h * headDim
+						kvHOff := kvH * headDim
+
+						for t := 0; t <= pos; t++ {
+							kOff := layerKVOff + t*kvDim + kvHOff
+							score := dotF32(s.Q[qOff:qOff+headDim], s.KeyCache[kOff:kOff+headDim])
+							s.Att[h*c.ContextLen+t] = score * invSqrtHD
+						}
+
+						softmaxF32(s.Att[h*c.ContextLen:h*c.ContextLen+pos+1], pos+1)
+
+						xbOff := qOff
+						for d := 0; d < headDim; d++ {
+							s.XB2[xbOff+d] = 0
+						}
+						for t := 0; t <= pos; t++ {
+							a := s.Att[h*c.ContextLen+t]
+							vOff := layerKVOff + t*kvDim + kvHOff
+							for d := 0; d < headDim; d++ {
+								s.XB2[xbOff+d] += a * s.ValueCache[vOff+d]
+							}
+						}
+					}
+					wg.Done()
+				}(hStart, hEnd)
 			}
+			wg.Wait()
+		} else {
+			for h := 0; h < c.NHeads; h++ {
+				kvH := h / c.KVGroups
+				qOff := h * headDim
+				kvHOff := kvH * headDim
 
-			softmaxF32(s.Att[h*c.ContextLen:h*c.ContextLen+pos+1], pos+1)
+				for t := 0; t <= pos; t++ {
+					kOff := layerKVOff + t*kvDim + kvHOff
+					score := dotF32(s.Q[qOff:qOff+headDim], s.KeyCache[kOff:kOff+headDim])
+					s.Att[h*c.ContextLen+t] = score * invSqrtHD
+				}
 
-			xbOff := qOff
-			for d := 0; d < headDim; d++ {
-				s.XB2[xbOff+d] = 0
-			}
-			for t := 0; t <= pos; t++ {
-				a := s.Att[h*c.ContextLen+t]
-				vOff := layerKVOff + t*kvDim + kvHOff
+				softmaxF32(s.Att[h*c.ContextLen:h*c.ContextLen+pos+1], pos+1)
+
+				xbOff := qOff
 				for d := 0; d < headDim; d++ {
-					s.XB2[xbOff+d] += a * s.ValueCache[vOff+d]
+					s.XB2[xbOff+d] = 0
+				}
+				for t := 0; t <= pos; t++ {
+					a := s.Att[h*c.ContextLen+t]
+					vOff := layerKVOff + t*kvDim + kvHOff
+					for d := 0; d < headDim; d++ {
+						s.XB2[xbOff+d] += a * s.ValueCache[vOff+d]
+					}
 				}
 			}
 		}
@@ -374,7 +432,7 @@ func (m *Model) Forward(token int, pos int) []float32 {
 		w.FFNUp[l].MatVec(s.HB2, s.XB)
 
 		for i := 0; i < c.HiddenDim; i++ {
-			s.HB[i] = (s.HB[i] / (1.0 + float32(math.Exp(float64(-s.HB[i]))))) * s.HB2[i]
+			s.HB[i] = (s.HB[i] / (1.0 + fastExp(-s.HB[i]))) * s.HB2[i]
 		}
 
 		w.FFNDown[l].MatVec(s.XB, s.HB)
@@ -390,6 +448,23 @@ func (m *Model) Forward(token int, pos int) []float32 {
 	w.Output.MatVec(s.Logits, s.X)
 
 	return s.Logits
+}
+
+// tokenProb computes P(token) from logits using log-sum-exp trick
+// without allocating or computing full softmax over 32K vocab
+func tokenProb(logits []float32, token int) float32 {
+	n := len(logits)
+	maxVal := logits[0]
+	for i := 1; i < n; i++ {
+		if logits[i] > maxVal {
+			maxVal = logits[i]
+		}
+	}
+	sumExp := float32(0)
+	for i := 0; i < n; i++ {
+		sumExp += fastExp(logits[i] - maxVal)
+	}
+	return fastExp(logits[token]-maxVal) / sumExp
 }
 
 // Generate text
@@ -411,10 +486,18 @@ func (m *Model) Generate(prompt string, maxTokens int, temp float32, topP float3
 	// Inner world dt per token (~0.1 subjective seconds)
 	dt := float32(0.1)
 
+	// Use pre-allocated buffers
+	logitsBuf := m.State.LogitsBuf
+
+	// Cache prophecy process lookup (avoid per-token linear scan)
+	var prophecyProc *ProphecyDebtAccumulation
+	if pd, ok := m.Inner.findProcess("prophecy").(*ProphecyDebtAccumulation); ok {
+		prophecyProc = pd
+	}
+
 	// Sample first token
-	logitsCopy := make([]float32, len(m.State.Logits))
-	copy(logitsCopy, m.State.Logits)
-	applyRepPenalty(logitsCopy, ids, repPenalty)
+	copy(logitsBuf, m.State.Logits)
+	applyRepPenalty(logitsBuf, ids, repPenalty)
 
 	// Step inner world — modulates generation parameters
 	m.Inner.Step(dt)
@@ -425,7 +508,7 @@ func (m *Model) Generate(prompt string, maxTokens int, temp float32, topP float3
 		effTopP = 1.0
 	}
 
-	next := sampleTopP(logitsCopy, effTemp, effTopP)
+	next := m.sampleTopP(logitsBuf, effTemp, effTopP)
 	generated = append(generated, next)
 	word := m.Tok.DecodeOne(next)
 	fmt.Print(word)
@@ -435,9 +518,9 @@ func (m *Model) Generate(prompt string, maxTokens int, temp float32, topP float3
 		m.Forward(next, pos)
 		pos++
 
-		copy(logitsCopy, m.State.Logits)
-		allToks := append(ids, generated...)
-		applyRepPenalty(logitsCopy, allToks, effRep)
+		copy(logitsBuf, m.State.Logits)
+		applyRepPenalty(logitsBuf, ids, effRep)
+		applyRepPenalty(logitsBuf, generated, effRep)
 
 		// Step inner world each token
 		m.Inner.Step(dt)
@@ -448,19 +531,13 @@ func (m *Model) Generate(prompt string, maxTokens int, temp float32, topP float3
 			effTopP = 1.0
 		}
 
-		// Accumulate prophecy debt from token probability
-		softmaxCopy := make([]float32, len(logitsCopy))
-		copy(softmaxCopy, logitsCopy)
-		softmaxF32(softmaxCopy, len(softmaxCopy))
-
-		next = sampleTopP(logitsCopy, effTemp, effTopP)
-
-		// Feed token probability to prophecy system
-		if pd, ok := m.Inner.findProcess("prophecy").(*ProphecyDebtAccumulation); ok {
-			if next >= 0 && next < len(softmaxCopy) {
-				pd.AccumulateDebt(m.Inner.State, softmaxCopy[next])
-			}
+		// Compute P(token) for prophecy debt — no full softmax needed
+		if prophecyProc != nil && next >= 0 && next < len(m.State.Logits) {
+			prob := tokenProb(m.State.Logits, next)
+			prophecyProc.AccumulateDebt(m.Inner.State, prob)
 		}
+
+		next = m.sampleTopP(logitsBuf, effTemp, effTopP)
 
 		if next == m.Tok.EOS {
 			break
@@ -501,7 +578,12 @@ func applyRepPenalty(logits []float32, prev []int, penalty float32) {
 	}
 }
 
-func sampleTopP(logits []float32, temp, topP float32) int {
+type sampleItem struct {
+	id int
+	p  float32
+}
+
+func (m *Model) sampleTopP(logits []float32, temp, topP float32) int {
 	n := len(logits)
 
 	// Greedy (argmax) when temp=0
@@ -520,13 +602,11 @@ func sampleTopP(logits []float32, temp, topP float32) int {
 	}
 	softmaxF32(logits, n)
 
-	type tp struct {
-		id int
-		p  float32
-	}
-	items := make([]tp, n)
+	// Use pre-allocated buffer
+	items := m.State.SampleBuf[:n]
 	for i := 0; i < n; i++ {
-		items[i] = tp{i, logits[i]}
+		items[i].id = i
+		items[i].p = logits[i]
 	}
 	sort.Slice(items, func(i, j int) bool {
 		return items[i].p > items[j].p
