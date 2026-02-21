@@ -56,6 +56,9 @@ Auto-downloaded on first run. Or specify path manually:
 # Build
 go build -o arianna3b .
 
+# Build with BLAS acceleration (recommended)
+go build -tags blas -o arianna3b .
+
 # Just run — weights download automatically
 ./arianna3b
 
@@ -65,6 +68,15 @@ go build -o arianna3b .
 # REPL
 ./arianna3b
 ```
+
+### BLAS Acceleration (optional)
+
+`-tags blas` enables hardware-accelerated linear algebra via Apple Accelerate (macOS) or OpenBLAS (Linux: `apt install libopenblas-dev`). Without the tag: pure Go fallback, same results.
+
+| Hot path | BLAS call | What it accelerates |
+|----------|-----------|-------------------|
+| `matVecF32` | `cblas_sgemv` | Float32 matrix-vector multiply (RMSNorm, output projection) |
+| `dotF32` | `cblas_sdot` | Dot product (attention scores) |
 
 ### REPL Commands
 
