@@ -119,6 +119,10 @@ func matVecQ8_0Range(out []float32, mat []byte, vec []float32, start, end, block
 
 // F32 matrix-vector multiply (for norm weights etc)
 func matVecF32(out []float32, mat []float32, vec []float32, rows, cols int) {
+	if useBLAS {
+		blasMatVecF32(out, mat, vec, rows, cols)
+		return
+	}
 	for i := 0; i < rows; i++ {
 		sum := float32(0)
 		off := i * cols
@@ -131,6 +135,9 @@ func matVecF32(out []float32, mat []float32, vec []float32, rows, cols int) {
 
 // Dot product
 func dotF32(a, b []float32) float32 {
+	if useBLAS && len(a) > 0 {
+		return blasDotF32(a, b)
+	}
 	sum := float32(0)
 	for i := range a {
 		sum += a[i] * b[i]
